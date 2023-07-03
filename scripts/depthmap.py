@@ -34,12 +34,23 @@ import copy
 import platform
 import vispy
 import trimesh
+import os
 import math
 import subprocess
+import traceback
+import pathlib
+import os
 
-sys.path.append('extensions/stable-diffusion-webui-depthmap-script/scripts')
+# Not sure if this is needed
+try:
+	script_dir = os.path.dirname(os.path.realpath(__file__))
+	extension_dir = pathlib.Path(script_dir).parent
+	sys.path.append(extension_dir)
+except:
+	sys.path.append('extensions/stable-diffusion-webui-depthmap-script')
 
-from stereoimage_generation import create_stereoimages
+
+from scripts.stereoimage_generation import create_stereoimages
 
 # midas imports
 from dmidas.dpt_depth import DPTDepthModel
@@ -73,7 +84,7 @@ from rembg import new_session, remove
 whole_size_threshold = 1600  # R_max from the paper
 pix2pixsize = 1024
 scriptname = "DepthMap"
-scriptversion = "v0.3.11"
+scriptversion = "v0.3.12"
 
 global video_mesh_data, video_mesh_fn
 video_mesh_data = None
@@ -85,14 +96,21 @@ depthmap_model_pix2pix = None
 depthmap_model_type = None
 depthmap_deviceidx = None
 
+commit_hash = None  # TODO: understand why it would spam to stderr if changed to ... = get_commit_hash()
 def get_commit_hash():
-	try:
-		hash = subprocess.check_output([os.environ.get('GIT', "git"), "rev-parse", "HEAD"], shell=False, encoding='utf8').strip()
-		hash = hash[0:8]
-		return hash
-	except Exception:
-		return "<none>"
-commit_hash = get_commit_hash()
+	global commit_hash
+	if commit_hash is None:
+		try:
+			commit_hash = subprocess.check_output(
+				[os.environ.get('GIT', "git"), "rev-parse", "HEAD"],
+				cwd=pathlib.Path.cwd().joinpath('extensions/stable-diffusion-webui-depthmap-script/'),
+				shell=False,
+				stderr=subprocess.DEVNULL,
+				encoding='utf8').strip()[0:8]
+		except Exception:
+			commit_hash = "<none>"
+	return commit_hash
+
 
 def main_ui_panel(is_depth_tab):
 	with gr.Blocks():
@@ -141,6 +159,8 @@ def main_ui_panel(is_depth_tab):
 			with gr.Row(visible=False) as stereo_options_row_1:
 				stereo_divergence = gr.Slider(minimum=0.05, maximum=10.005, step=0.01, label='Divergence (3D effect)',
 											  value=2.5)
+				stereo_separation = gr.Slider(minimum=-5.0, maximum=5.0, step=0.01, label='Separation (moves images apart)',
+											  value=0.0)
 			with gr.Row(visible=False) as stereo_options_row_2:
 				stereo_fill = gr.Dropdown(label="Gap fill technique",
 										  choices=['none', 'naive', 'naive_interpolating', 'polylines_soft',
@@ -180,6 +200,18 @@ def main_ui_panel(is_depth_tab):
 
 		gen_normal = gr.Checkbox(label="Generate Normalmap (hidden! api only)", value=False, visible=False)
 
+
+		# Invert_depthmap must not be used with gen_stereo - otherwise stereo images look super-wrong
+		gen_stereo.change(
+			fn=lambda a, b: False if b else a,
+			inputs=[invert_depth, gen_stereo],
+			outputs=[invert_depth]
+		)
+		gen_stereo.change(
+			fn=lambda a, b: invert_depth.update(interactive = not b),
+			inputs=[invert_depth, gen_stereo],
+			outputs=[invert_depth]
+		)
 
 		clipthreshold_far.change(
 			fn=lambda a, b: a if b < a else b,
@@ -248,7 +280,7 @@ def main_ui_panel(is_depth_tab):
 			outputs=[bgrem_options_row_1, bgrem_options_row_2]
 		)
 
-	return [compute_device, model_type, net_width, net_height, match_size, boost, invert_depth, clipdepth, clipthreshold_far, clipthreshold_near, combine_output, combine_output_axis, save_depth, show_depth, show_heat, gen_stereo, stereo_modes, stereo_divergence, stereo_fill, stereo_balance, inpaint, inpaint_vids, background_removal, save_background_removal_masks, gen_normal, pre_depth_background_removal, background_removal_model, gen_mesh, mesh_occlude, mesh_spherical]
+	return [compute_device, model_type, net_width, net_height, match_size, boost, invert_depth, clipdepth, clipthreshold_far, clipthreshold_near, combine_output, combine_output_axis, save_depth, show_depth, show_heat, gen_stereo, stereo_modes, stereo_divergence, stereo_separation, stereo_fill, stereo_balance, inpaint, inpaint_vids, background_removal, save_background_removal_masks, gen_normal, pre_depth_background_removal, background_removal_model, gen_mesh, mesh_occlude, mesh_spherical]
 
 
 class Script(scripts.Script):
@@ -265,7 +297,7 @@ class Script(scripts.Script):
 
 	# run from script in txt2img or img2img
 	def run(self, p,
-			compute_device, model_type, net_width, net_height, match_size, boost, invert_depth, clipdepth, clipthreshold_far, clipthreshold_near, combine_output, combine_output_axis, save_depth, show_depth, show_heat, gen_stereo, stereo_modes, stereo_divergence, stereo_fill, stereo_balance, inpaint, inpaint_vids, background_removal, save_background_removal_masks, gen_normal, pre_depth_background_removal, background_removal_model, gen_mesh, mesh_occlude, mesh_spherical
+			compute_device, model_type, net_width, net_height, match_size, boost, invert_depth, clipdepth, clipthreshold_far, clipthreshold_near, combine_output, combine_output_axis, save_depth, show_depth, show_heat, gen_stereo, stereo_modes, stereo_divergence, stereo_separation, stereo_fill, stereo_balance, inpaint, inpaint_vids, background_removal, save_background_removal_masks, gen_normal, pre_depth_background_removal, background_removal_model, gen_mesh, mesh_occlude, mesh_spherical
 			):
 
 		# sd process 
@@ -291,7 +323,7 @@ class Script(scripts.Script):
 
 		newmaps, mesh_fi, meshsimple_fi = run_depthmap(processed, p.outpath_samples, inputimages, None,
                                         compute_device, model_type,
-                                        net_width, net_height, match_size, boost, invert_depth, clipdepth, clipthreshold_far, clipthreshold_near, combine_output, combine_output_axis, save_depth, show_depth, show_heat, gen_stereo, stereo_modes, stereo_divergence, stereo_fill, stereo_balance, inpaint, inpaint_vids, background_removal, save_background_removal_masks, gen_normal,
+                                        net_width, net_height, match_size, boost, invert_depth, clipdepth, clipthreshold_far, clipthreshold_near, combine_output, combine_output_axis, save_depth, show_depth, show_heat, gen_stereo, stereo_modes, stereo_divergence, stereo_separation, stereo_fill, stereo_balance, inpaint, inpaint_vids, background_removal, save_background_removal_masks, gen_normal,
                                         background_removed_images, "mp4", 0, False, None, False, gen_mesh, mesh_occlude, mesh_spherical )
 		
 		for img in newmaps:
@@ -299,18 +331,26 @@ class Script(scripts.Script):
 
 		return processed
 
+def unload_sd_model():
+	if shared.sd_model is not None:
+		shared.sd_model.cond_stage_model.to(devices.cpu)
+		shared.sd_model.first_stage_model.to(devices.cpu)
+
+def reload_sd_model():
+	if shared.sd_model is not None:
+		shared.sd_model.cond_stage_model.to(devices.device)
+		shared.sd_model.first_stage_model.to(devices.device)
+
 def run_depthmap(processed, outpath, inputimages, inputnames,
-                 compute_device, model_type, net_width, net_height, match_size, boost, invert_depth, clipdepth, clipthreshold_far, clipthreshold_near, combine_output, combine_output_axis, save_depth, show_depth, show_heat, gen_stereo, stereo_modes, stereo_divergence, stereo_fill, stereo_balance, inpaint, inpaint_vids, background_removal, save_background_removal_masks, gen_normal,
+                 compute_device, model_type, net_width, net_height, match_size, boost, invert_depth, clipdepth, clipthreshold_far, clipthreshold_near, combine_output, combine_output_axis, save_depth, show_depth, show_heat, gen_stereo, stereo_modes, stereo_divergence, stereo_separation, stereo_fill, stereo_balance, inpaint, inpaint_vids, background_removal, save_background_removal_masks, gen_normal,
                  background_removed_images, fnExt, vid_ssaa, custom_depthmap, custom_depthmap_img, depthmap_batch_reuse, gen_mesh, mesh_occlude, mesh_spherical):
 
 	if len(inputimages) == 0 or inputimages[0] == None:
 		return [], []
-	
-	print(f"\n{scriptname} {scriptversion} ({commit_hash})")
 
-	# unload sd model
-	shared.sd_model.cond_stage_model.to(devices.cpu)
-	shared.sd_model.first_stage_model.to(devices.cpu)
+	print(f"\n{scriptname} {scriptversion} ({get_commit_hash()})")
+
+	unload_sd_model()
 
 	meshsimple_fi = None
 	mesh_fi = None
@@ -352,8 +392,13 @@ def run_depthmap(processed, outpath, inputimages, inputnames,
 			if model_type == 0: 
 				model_path = f"{model_dir}/res101.pth"
 				print(model_path)
-				if not os.path.exists(model_path):
-					download_file(model_path,"https://cloudstor.aarnet.edu.au/plus/s/lTIJF4vrvHCAI31/download")
+				ensure_file_downloaded(
+					model_path,
+					["https://cloudstor.aarnet.edu.au/plus/s/lTIJF4vrvHCAI31/download",
+					 "https://huggingface.co/lllyasviel/Annotators/resolve/5bc80eec2b4fddbb/res101.pth",
+					 ],
+					"1d696b2ef3e8336b057d0c15bc82d2fecef821bfebe5ef9d7671a5ec5dde520b")
+				ensure_file_downloaded(model_path, "https://cloudstor.aarnet.edu.au/plus/s/lTIJF4vrvHCAI31/download")
 				if compute_device == 0:
 					checkpoint = torch.load(model_path)
 				else:
@@ -367,8 +412,7 @@ def run_depthmap(processed, outpath, inputimages, inputnames,
 			if model_type == 1: 
 				model_path = f"{model_dir}/dpt_beit_large_512.pt"
 				print(model_path)
-				if not os.path.exists(model_path):
-					download_file(model_path,"https://github.com/isl-org/MiDaS/releases/download/v3_1/dpt_beit_large_512.pt")
+				ensure_file_downloaded(model_path, "https://github.com/isl-org/MiDaS/releases/download/v3_1/dpt_beit_large_512.pt")
 				model = DPTDepthModel(
 					path=model_path,
 					backbone="beitl16_512",
@@ -382,8 +426,7 @@ def run_depthmap(processed, outpath, inputimages, inputnames,
 			if model_type == 2: 
 				model_path = f"{model_dir}/dpt_beit_large_384.pt"
 				print(model_path)
-				if not os.path.exists(model_path):
-					download_file(model_path,"https://github.com/isl-org/MiDaS/releases/download/v3_1/dpt_beit_large_384.pt")
+				ensure_file_downloaded(model_path, "https://github.com/isl-org/MiDaS/releases/download/v3_1/dpt_beit_large_384.pt")
 				model = DPTDepthModel(
 					path=model_path,
 					backbone="beitl16_384",
@@ -397,8 +440,7 @@ def run_depthmap(processed, outpath, inputimages, inputnames,
 			if model_type == 3: 
 				model_path = f"{model_dir}/dpt_large-midas-2f21e586.pt"
 				print(model_path)
-				if not os.path.exists(model_path):
-					download_file(model_path,"https://github.com/intel-isl/DPT/releases/download/1_0/dpt_large-midas-2f21e586.pt")
+				ensure_file_downloaded(model_path, "https://github.com/intel-isl/DPT/releases/download/1_0/dpt_large-midas-2f21e586.pt")
 				model = DPTDepthModel(
 					path=model_path,
 					backbone="vitl16_384",
@@ -412,8 +454,7 @@ def run_depthmap(processed, outpath, inputimages, inputnames,
 			elif model_type == 4: 
 				model_path = f"{model_dir}/dpt_hybrid-midas-501f0c75.pt"
 				print(model_path)
-				if not os.path.exists(model_path):
-					download_file(model_path,"https://github.com/intel-isl/DPT/releases/download/1_0/dpt_hybrid-midas-501f0c75.pt")
+				ensure_file_downloaded(model_path,"https://github.com/intel-isl/DPT/releases/download/1_0/dpt_hybrid-midas-501f0c75.pt")
 				model = DPTDepthModel(
 					path=model_path,
 					backbone="vitb_rn50_384",
@@ -427,8 +468,7 @@ def run_depthmap(processed, outpath, inputimages, inputnames,
 			elif model_type == 5: 
 				model_path = f"{model_dir}/midas_v21-f6b98070.pt"
 				print(model_path)
-				if not os.path.exists(model_path):
-					download_file(model_path,"https://github.com/AlexeyAB/MiDaS/releases/download/midas_dpt/midas_v21-f6b98070.pt")
+				ensure_file_downloaded(model_path,"https://github.com/AlexeyAB/MiDaS/releases/download/midas_dpt/midas_v21-f6b98070.pt")
 				model = MidasNet(model_path, non_negative=True)
 				net_w, net_h = 384, 384
 				resize_mode="upper_bound"
@@ -440,8 +480,7 @@ def run_depthmap(processed, outpath, inputimages, inputnames,
 			elif model_type == 6: 
 				model_path = f"{model_dir}/midas_v21_small-70d6b9c8.pt"
 				print(model_path)
-				if not os.path.exists(model_path):
-					download_file(model_path,"https://github.com/AlexeyAB/MiDaS/releases/download/midas_dpt/midas_v21_small-70d6b9c8.pt")
+				ensure_file_downloaded(model_path,"https://github.com/AlexeyAB/MiDaS/releases/download/midas_dpt/midas_v21_small-70d6b9c8.pt")
 				model = MidasNet_small(model_path, features=64, backbone="efficientnet_lite3", exportable=True, non_negative=True, blocks={'expand': True})
 				net_w, net_h = 256, 256
 				resize_mode="upper_bound"
@@ -473,9 +512,12 @@ def run_depthmap(processed, outpath, inputimages, inputnames,
 			pix2pixmodel = None
 			# load merge network if boost enabled or keepmodels enabled
 			if boost or (hasattr(opts, 'depthmap_script_keepmodels') and opts.depthmap_script_keepmodels):
-				pix2pixmodel_path = './models/pix2pix/latest_net_G.pth'
-				if not os.path.exists(pix2pixmodel_path):
-					download_file(pix2pixmodel_path,"https://sfu.ca/~yagiz/CVPR21/latest_net_G.pth")
+				# sfu.ca unfortunately is not very reliable, we use a mirror just in case
+				ensure_file_downloaded(
+					'./models/pix2pix/latest_net_G.pth',
+					["https://huggingface.co/lllyasviel/Annotators/blob/9a7d84251d487d11/latest_net_G.pth",
+					"https://sfu.ca/~yagiz/CVPR21/latest_net_G.pth"],
+					'50ec735d74ed6499562d898f41b49343e521808b8dae589aa3c2f5c9ac9f7462')
 				opt = TestOptions().parse()
 				if compute_device == 1:
 					opt.gpu_ids = [] # cpu mode
@@ -656,14 +698,24 @@ def run_depthmap(processed, outpath, inputimages, inputnames,
 					if save_depth and processed is not None:
 						# only save 16 bit single channel image when PNG format is selected
 						if opts.samples_format == "png":
-							images.save_image(Image.fromarray(img_output), outpath, "", processed.all_seeds[count], processed.all_prompts[count], opts.samples_format, info=info, p=processed, suffix="_depth")
+							try:
+								images.save_image(Image.fromarray(img_output), outpath, "", processed.all_seeds[count], processed.all_prompts[count], opts.samples_format, info=info, p=processed, suffix="_depth")
+							except Exception as ve:
+								if not ('image has wrong mode' in str(ve) or 'I;16' in str(ve)): raise ve
+								print('Catched exception: image has wrong mode!')
+								traceback.print_exc()
 						else:
 							images.save_image(Image.fromarray(img_output2), outpath, "", processed.all_seeds[count], processed.all_prompts[count], opts.samples_format, info=info, p=processed, suffix="_depth")
 					elif save_depth:
 						# from depth tab
 						# only save 16 bit single channel image when PNG format is selected
 						if opts.samples_format == "png":
-							images.save_image(Image.fromarray(img_output), path=outpath, basename=basename, seed=None, prompt=None, extension=opts.samples_format, info=info, short_filename=True,no_prompt=True, grid=False, pnginfo_section_name="extras", existing_info=None, forced_filename=None)
+							try:
+								images.save_image(Image.fromarray(img_output), path=outpath, basename=basename, seed=None, prompt=None, extension=opts.samples_format, info=info, short_filename=True,no_prompt=True, grid=False, pnginfo_section_name="extras", existing_info=None, forced_filename=None)
+							except Exception as ve:
+								if not ('image has wrong mode' in str(ve) or 'I;16' in str(ve)): raise ve
+								print('Catched exception: image has wrong mode!')
+								traceback.print_exc()
 						else:
 							images.save_image(Image.fromarray(img_output2), path=outpath, basename=basename, seed=None, prompt=None, extension=opts.samples_format, info=info, short_filename=True,no_prompt=True, grid=False, pnginfo_section_name="extras", existing_info=None, forced_filename=None)
 				else:
@@ -680,7 +732,7 @@ def run_depthmap(processed, outpath, inputimages, inputnames,
 				print("Generating stereoscopic images..")
 
 				stereomodes = stereo_modes
-				stereoimages = create_stereoimages(inputimages[count], img_output, stereo_divergence, stereomodes, stereo_balance, stereo_fill)
+				stereoimages = create_stereoimages(inputimages[count], img_output, stereo_divergence, stereo_separation, stereomodes, stereo_balance, stereo_fill)
 
 				for c in range(0, len(stereoimages)):
 					outimages.append(stereoimages[c])
@@ -765,23 +817,14 @@ def run_depthmap(processed, outpath, inputimages, inputnames,
 
 		gc.collect()
 		devices.torch_gc()
-		# reload sd model
-		shared.sd_model.cond_stage_model.to(devices.device)
-		shared.sd_model.first_stage_model.to(devices.device)
-
-	
+		reload_sd_model()
 	try:
 		if inpaint:
-			# unload sd model
-			shared.sd_model.cond_stage_model.to(devices.cpu)
-			shared.sd_model.first_stage_model.to(devices.cpu)
-
+			unload_sd_model()
 			mesh_fi = run_3dphoto(device, inpaint_imgs, inpaint_depths, inputnames, outpath, fnExt, vid_ssaa, inpaint_vids)
 	
 	finally:
-		# reload sd model
-		shared.sd_model.cond_stage_model.to(devices.device)
-		shared.sd_model.first_stage_model.to(devices.device)
+		reload_sd_model()
 		print("All done.")
 
 	return outimages, mesh_fi, meshsimple_fi
@@ -831,12 +874,9 @@ def run_3dphoto(device, img_rgb, img_depth, inputnames, outpath, fnExt, vid_ssaa
 		# create paths to model if not present
 		os.makedirs('./models/3dphoto/', exist_ok=True)
 
-		if not os.path.exists(edgemodel_path):
-			download_file(edgemodel_path,"https://filebox.ece.vt.edu/~jbhuang/project/3DPhoto/model/edge-model.pth")
-		if not os.path.exists(depthmodel_path):
-			download_file(depthmodel_path,"https://filebox.ece.vt.edu/~jbhuang/project/3DPhoto/model/depth-model.pth")
-		if not os.path.exists(colormodel_path):
-			download_file(colormodel_path,"https://filebox.ece.vt.edu/~jbhuang/project/3DPhoto/model/color-model.pth")
+		ensure_file_downloaded(edgemodel_path,"https://filebox.ece.vt.edu/~jbhuang/project/3DPhoto/model/edge-model.pth")
+		ensure_file_downloaded(depthmodel_path,"https://filebox.ece.vt.edu/~jbhuang/project/3DPhoto/model/depth-model.pth")
+		ensure_file_downloaded(colormodel_path,"https://filebox.ece.vt.edu/~jbhuang/project/3DPhoto/model/color-model.pth")
 		
 		print("Loading edge model ..")
 		depth_edge_model = Inpaint_Edge_Net(init_weights=True)
@@ -1116,6 +1156,7 @@ def run_generate(depthmap_mode,
                 gen_stereo,
                 stereo_modes,
                 stereo_divergence,
+				stereo_separation,
                 stereo_fill,
                 stereo_balance,
                 inpaint,
@@ -1183,7 +1224,7 @@ def run_generate(depthmap_mode,
 
 	outputs, mesh_fi, meshsimple_fi = run_depthmap(
         None, outpath, imageArr, imageNameArr,
-        compute_device, model_type, net_width, net_height, match_size, boost, invert_depth, clipdepth, clipthreshold_far, clipthreshold_near, combine_output, combine_output_axis, save_depth, show_depth, show_heat, gen_stereo, stereo_modes, stereo_divergence, stereo_fill, stereo_balance, inpaint, inpaint_vids, background_removal, save_background_removal_masks, gen_normal,
+        compute_device, model_type, net_width, net_height, match_size, boost, invert_depth, clipdepth, clipthreshold_far, clipthreshold_near, combine_output, combine_output_axis, save_depth, show_depth, show_heat, gen_stereo, stereo_modes, stereo_divergence, stereo_separation, stereo_fill, stereo_balance, inpaint, inpaint_vids, background_removal, save_background_removal_masks, gen_normal,
         background_removed_images, fnExt, vid_ssaa, custom_depthmap, custom_depthmap_img, depthmap_batch_reuse, gen_mesh, mesh_occlude, mesh_spherical)
 
 	# use inpainted 3d mesh to show in 3d model output when enabled in settings
@@ -1242,7 +1283,7 @@ def on_ui_tabs():
                 submit = gr.Button('Generate', elem_id="depthmap_generate", variant='primary')
 
 				# insert main panel
-                compute_device, model_type, net_width, net_height, match_size, boost, invert_depth, clipdepth, clipthreshold_far, clipthreshold_near, combine_output, combine_output_axis, save_depth, show_depth, show_heat, gen_stereo, stereo_modes, stereo_divergence, stereo_fill, stereo_balance, inpaint, inpaint_vids, background_removal, save_background_removal_masks, gen_normal, pre_depth_background_removal, background_removal_model, gen_mesh, mesh_occlude, mesh_spherical = main_ui_panel(True)
+                compute_device, model_type, net_width, net_height, match_size, boost, invert_depth, clipdepth, clipthreshold_far, clipthreshold_near, combine_output, combine_output_axis, save_depth, show_depth, show_heat, gen_stereo, stereo_modes, stereo_divergence, stereo_separation, stereo_fill, stereo_balance, inpaint, inpaint_vids, background_removal, save_background_removal_masks, gen_normal, pre_depth_background_removal, background_removal_model, gen_mesh, mesh_occlude, mesh_spherical = main_ui_panel(True)
 
                 unloadmodels = gr.Button('Unload models', elem_id="depthmap_unloadmodels")
 
@@ -1335,6 +1376,7 @@ def on_ui_tabs():
 				gen_stereo,
 				stereo_modes,
 				stereo_divergence,
+				stereo_separation,
 				stereo_fill,
 				stereo_balance,
 				inpaint,
@@ -1405,12 +1447,22 @@ def batched_background_removal(inimages, model_name):
 	del background_removal_session
 	return outimages
 
-def download_file(filename, url):
-	print("Downloading", url, "to", filename)
-	torch.hub.download_url_to_file(url, filename)
-	# check if file exists
-	if not os.path.exists(filename):
-		raise RuntimeError('Download failed. Try again later or manually download the file to that location.')
+def ensure_file_downloaded(filename, url, sha256_hash_prefix=None):
+	# Do not check the hash every time - it is somewhat time-consuming
+	if os.path.exists(filename):
+		return
+
+	if type(url) is not list:
+		url = [url]
+	for cur_url in url:
+		try:
+			print("Downloading", cur_url, "to", filename)
+			torch.hub.download_url_to_file(cur_url, filename, sha256_hash_prefix)
+			if os.path.exists(filename):
+				return  # The correct model was downloaded, no need to try more
+		except:
+			pass
+	raise RuntimeError('Download failed. Try again later or manually download the file to that location.')
 
 def estimatezoedepth(img, model, w, h):
 	#x = transforms.ToTensor()(img).unsqueeze(0)
