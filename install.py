@@ -2,6 +2,8 @@ import launch
 import platform
 import sys
 
+# TODO: some dependencies apparently being reinstalled on every run. Investigate and fix.
+
 if sys.version_info < (3, 8):
     launch.run_pip("install importlib-metadata", "importlib-metadata for depthmap script")
     import importlib_metadata
@@ -30,14 +32,19 @@ ensure('trimesh')
 ensure('numba', '0.57.0')
 ensure('vispy', '0.13.0')
 
-ensure('rembg')
+ensure('rembg', '2.0.50')
 
 if not launch.is_installed("moviepy"):
     launch.run_pip('install "moviepy==1.0.2"', "moviepy requirement for depthmap script")
 ensure('transforms3d', '0.4.1')
 
 ensure('imageio')  # 2.4.1
-ensure('imageio-ffmpeg')
+try:  # Dirty hack to not reinstall every time
+    importlib_metadata.version('imageio-ffmpeg')
+except:
+    ensure('imageio-ffmpeg')
+
+
 if not launch.is_installed("networkx"):
     launch.run_pip('install install "networkx==2.5"', "networkx requirement for depthmap script")
 if platform.system() == 'Windows':
